@@ -26,11 +26,11 @@ class QuantizedWeights:
         use_simdgroup_matvec: bool = True,
         use_split_k_matmul: bool = False,
     ):
-        self.scales = scales
-        self.biases = biases
+        self.scales = scales       # (K, N/G) bfp16
+        self.biases = biases       # (K, N/G) bfp16
         self.group_size = group_size
-        self.bits = bits
-        self.weight = weight
+        self.bits = bits           # Number of quantization bits (4 bit / 16 bit)
+        self.weight = weight        # (K, N/8) uint32
         self.use_simdgroup_matmul = use_simdgroup_matmul
         self.use_simdgroup_matvec = use_simdgroup_matvec
         self.use_split_k_matmul = use_split_k_matmul
@@ -76,7 +76,28 @@ def dequantize_weights(
     group_size: int,
     bits: int,
 ) -> mx.array:
-    pass
+    
+    # weight => *(... , K, N / 8)
+    ## Convert this into (..., K, N) uint4s
+    ## Shift by 0, 4, 8, 12, 16, 20, 24, 28 & 0b1111
+    shift = mx.arange(32//bits) * bits # (8,)
+    weight = weight[..., None] # (..., K, N/8, 1)
+    mask = (1<<bits) - 1
+    unpacked_weights = (weight >> shift) & mask
+    unpacked_weights = unpacked_weights.reshape(*unpacked_weights.shape[:-2], unpacked_weights.shape[-2] * unpacked_weights.shape[-1]) # (..., K, N)
+    scales = mx.repeat(scales, group_size, axis=-1)
+    if biases is None:
+        return unpacked_weights * scales
+        
+    biases = mx.repeat(biases, group_size, axis=-1)
+    dequantized_weights = unpacked_weights * scales + biases
+    return dequantized_weights
+
+
+    
+
+
+
 
 
 def quantized_matvec_custom(
@@ -108,4 +129,6 @@ def quantized_linear(
     w: QuantizedWeights,
     bias: mx.array | None = None,
 ) -> mx.array:
-    pass
+    
+    return quantized_matmul(w.scales, w.biases, w.group_size, w.bits, x, w.weight)
+

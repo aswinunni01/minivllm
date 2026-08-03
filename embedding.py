@@ -1,5 +1,5 @@
 import mlx.core as mx
-from .quantize import QuantizedWeights
+from .quantize import QuantizedWeights, dequantize_weights
 
 
 class Embedding:
@@ -23,10 +23,17 @@ class QuantizedEmbedding:
         weight: QuantizedWeights,
         use_custom_kernel: bool = False,
     ):
-        pass
+        self.vocab_size = vocab_size
+        self.embedding_dim = embedding_dim
+        self.weight = weight
 
     def __call__(self, x: mx.array) -> mx.array:
-        pass
+        embeddings_quantized = self.weight.weight[x]
+        scales = self.weight.scales[x]
+        biases = None if self.weight.biases is None else self.weight.biases[x]
+        embeddings_dequantized = dequantize_weights(embeddings_quantized, scales, biases, self.weight.group_size, self.weight.bits)
+        return embeddings_dequantized
+
 
     def as_linear(self, x: mx.array) -> mx.array:
         pass
