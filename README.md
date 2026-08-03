@@ -26,12 +26,13 @@ This repository contains my personal, from-scratch implementation of the `tiny-l
 
 ## 📊 Benchmarks (Apple M1 Air, 16GB)
 
-The following benchmark values are evaluated on **Qwen3-0.6B** (Input: 128 tokens, Output: 129 tokens, `prefill-logits=all`):
+The following benchmark values are evaluated on **Qwen3-0.6B** (Input: 128 tokens, Output: 129 tokens, `prefill-logits=last`):
 
 | Checkpoint | Prefill Throughput (tok/s) | Decode Throughput (tok/s) | Notes |
 | :--- | :---: | :---: | :--- |
-| **Week 1 (No Cache)** | 1007.65 | 4.69 | Recomputes full context every step |
-| **MLX Baseline** | 833.83 | 108.21 | MLX reference baseline |
+| **Week 1 (No Cache)** | 1007.65* | 4.69* | *Note: Evaluated with `prefill-logits=all` |
+| **2.1 KV Cache** | 1028.09 | 32.38 | Hand-written KV cache implementation |
+| **MLX Baseline** | 1069.72 | 108.84 | MLX reference baseline |
 
 ---
 
