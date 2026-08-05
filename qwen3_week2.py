@@ -6,15 +6,23 @@ from .basics import linear, silu
 from .attention import scaled_dot_product_attention_grouped
 from .positional_encoding import RoPE
 from .layer_norm import RMSNorm
-from .embedding import Embedding
+from .embedding import Embedding, QuantizedEmbedding
 from .kv_cache import TinyKvCache, TinyKvFullCache
-from .quantize import QuantizedWeights, dequantize_linear
+from .quantize import QuantizedWeights, dequantize_linear, quantized_linear
 from .week2_kernels import (
     FastRMSNorm,
     FastRoPE,
     scaled_dot_product_attention,
     swiglu,
 )
+
+
+def _linear(x: mx.array, weight: mx.array | QuantizedWeights) -> mx.array:
+    # Dense projections keep using linear(); QuantizedWeights route through
+    # the quantized matmul/matvec path so weights stay packed end to end.
+    if isinstance(weight, QuantizedWeights):
+        return quantized_linear(x, weight)
+    return linear(x, weight)
 
 WEEK2_CHECKPOINTS = (
     "kv-cache",
@@ -86,9 +94,9 @@ class Qwen3MultiHeadAttention:
         mask: mx.array | str | None = None,
     ) -> mx.array:
         
-        Q = linear(x, self.wq) # (B, L, Hq x D)
-        K = linear(x, self.wk) # (B, L, H x D). Note this time it is L, not S because (S-L) will be retrieved from kv cache
-        V = linear(x, self.wv) # (B, L, H x D)
+        Q = _linear(x, self.wq) # (B, L, Hq x D)
+        K = _linear(x, self.wk) # (B, L, H x D). Note this time it is L, not S because (S-L) will be retrieved from kv cache
+        V = _linear(x, self.wv) # (B, L, H x D)
 
         Q = Q.reshape(Q.shape[0], Q.shape[1], self.num_heads, self.head_dim)
         K = K.reshape(K.shape[0], K.shape[1], self.num_kv_heads, self.head_dim)
@@ -114,7 +122,7 @@ class Qwen3MultiHeadAttention:
         weighted_values = weighted_values.swapaxes(2, 1)
         weighted_values = weighted_values.reshape(Q.shape[0], Q.shape[2], self.num_heads*self.head_dim) #(B, L, Hq X D)
 
-        output = linear(weighted_values, self.wo) # (B, L, E)
+        output = _linear(weighted_values, self.wo) # (B, L, E)
 
         return output
 
@@ -142,13 +150,13 @@ class Qwen3MLP:
         
 
     def __call__(self, x: mx.array) -> mx.array:
-        
-        up = linear(x, self.w_up)
-        gate = silu(linear(x, self.w_gate))
+
+        up = _linear(x, self.w_up)
+        gate = silu(_linear(x, self.w_gate))
         intermediate = up * gate
 
 
-        out = linear(intermediate, self.w_down)
+        out = _linear(intermediate, self.w_down)
 
         return out
 
@@ -249,6 +257,20 @@ class Qwen3ModelWeek2:
         self.use_fast_rope = checkpoint_index >= WEEK2_CHECKPOINTS.index("rope")
         self.use_fast_swiglu = checkpoint_index >= WEEK2_CHECKPOINTS.index("swiglu")
         self.use_decode_attention = checkpoint_index >= WEEK2_CHECKPOINTS.index("decode-attention")
+        # Weight packing starts at quantized-matvec; the SIMD-matrix and
+        # Split-K schedules unlock later in the week.
+        use_quantized_weights = checkpoint_index >= WEEK2_CHECKPOINTS.index("quantized-matvec")
+        use_simdgroup_matmul = checkpoint_index >= WEEK2_CHECKPOINTS.index("simd-matmul")
+        use_split_k_matmul = checkpoint_index >= WEEK2_CHECKPOINTS.index("split-k")
+
+        def model_weight(layer: Any) -> mx.array | QuantizedWeights:
+            if use_quantized_weights:
+                return QuantizedWeights.from_mlx_layer(
+                    layer,
+                    use_simdgroup_matmul=use_simdgroup_matmul,
+                    use_split_k_matmul=use_split_k_matmul,
+                )
+            return dequantize_linear(layer)
 
 
         self.vocab_size = mlx_model.args.vocab_size
@@ -265,22 +287,28 @@ class Qwen3ModelWeek2:
         self.max_seq_len = mlx_model.args.max_position_embeddings
 
         self.layers_inner = []
-        
-        self.embedding = Embedding(self.vocab_size, self.embedding_dim, dequantize_linear(mlx_model.model.embed_tokens))
+
+        # Keep the token embedding table packed as well; QuantizedEmbedding
+        # gathers rows and dequantizes with the shared unpacking helper.
+        embedding_weight = model_weight(mlx_model.model.embed_tokens)
+        if isinstance(embedding_weight, QuantizedWeights):
+            self.embedding = QuantizedEmbedding(self.vocab_size, self.embedding_dim, embedding_weight)
+        else:
+            self.embedding = Embedding(self.vocab_size, self.embedding_dim, embedding_weight)
 
 
         for i in range(self.num_hidden_layers):
-            wq = dequantize_linear(mlx_model.model.layers[i].self_attn.q_proj)
-            wk = dequantize_linear(mlx_model.model.layers[i].self_attn.k_proj)
-            wv = dequantize_linear(mlx_model.model.layers[i].self_attn.v_proj)
-            wo = dequantize_linear(mlx_model.model.layers[i].self_attn.o_proj)
+            wq = model_weight(mlx_model.model.layers[i].self_attn.q_proj)
+            wk = model_weight(mlx_model.model.layers[i].self_attn.k_proj)
+            wv = model_weight(mlx_model.model.layers[i].self_attn.v_proj)
+            wo = model_weight(mlx_model.model.layers[i].self_attn.o_proj)
 
             q_norm = mlx_model.model.layers[i].self_attn.q_norm.weight
             k_norm = mlx_model.model.layers[i].self_attn.k_norm.weight
 
-            w_gate = dequantize_linear(mlx_model.model.layers[i].mlp.gate_proj)
-            w_up =   dequantize_linear(mlx_model.model.layers[i].mlp.up_proj)
-            w_down = dequantize_linear(mlx_model.model.layers[i].mlp.down_proj)
+            w_gate = model_weight(mlx_model.model.layers[i].mlp.gate_proj)
+            w_up =   model_weight(mlx_model.model.layers[i].mlp.up_proj)
+            w_down = model_weight(mlx_model.model.layers[i].mlp.down_proj)
 
             w_input_layernorm = mlx_model.model.layers[i].input_layernorm.weight
             w_post_attention_layernorm = mlx_model.model.layers[i].post_attention_layernorm.weight
@@ -291,7 +319,8 @@ class Qwen3ModelWeek2:
         self.output_layernorm = RMSNorm(self.embedding_dim, mlx_model.model.norm.weight, self.rms_norm_eps)
         
         if(not mlx_model.args.tie_word_embeddings ):
-            self.out_lm_head = dequantize_linear(mlx_model.lm_head)
+            # lm_head is a projection, not a lookup: keep it quantized too.
+            self.out_lm_head = model_weight(mlx_model.lm_head)
         else:
             self.out_lm_head = None
 
@@ -328,6 +357,6 @@ class Qwen3ModelWeek2:
         if(self.out_lm_head is None):
             x = self.embedding.as_linear(x)
         else:
-            x = linear(x, self.out_lm_head)
+            x = _linear(x, self.out_lm_head)
 
         return x

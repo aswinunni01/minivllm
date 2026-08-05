@@ -1,5 +1,5 @@
 import mlx.core as mx
-from .quantize import QuantizedWeights, dequantize_weights
+from .quantize import QuantizedWeights, dequantize_weights, quantized_linear
 
 
 class Embedding:
@@ -36,4 +36,7 @@ class QuantizedEmbedding:
 
 
     def as_linear(self, x: mx.array) -> mx.array:
-        pass
+        # Tied output projection: keep the vocab table packed and route
+        # through the quantized matmul path instead of materializing
+        # vocab_size x hidden_size.
+        return quantized_linear(x, self.weight)

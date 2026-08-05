@@ -2,6 +2,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from extensions import tiny_llm_ext
+
 
 def dequantize_linear(mx_layer: Any) -> mx.array:
     w = mx.dequantize(
@@ -66,7 +68,24 @@ def quantized_matmul(
     use_simdgroup: bool = False,
     use_split_k: bool = False,
 ) -> mx.array:
-    pass
+    # General dispatcher: always goes through our extension primitive, which
+    # picks the SIMD-group matvec schedule for decode-shaped inputs (M <= 8)
+    # and a matrix schedule otherwise. Leading dimensions of `a` are folded
+    # into rows so the kernel only ever sees a 2D problem.
+    *batch, D = a.shape
+    a = a.reshape(-1, D)
+    result = tiny_llm_ext.quantized_matmul(
+        mx.contiguous(scales),
+        mx.contiguous(biases),
+        group_size,
+        bits,
+        mx.contiguous(a),
+        mx.contiguous(b),
+        transpose_b,
+        use_simdgroup,
+        use_split_k,
+    )
+    return result.reshape(*batch, -1)
 
 
 def dequantize_weights(
@@ -109,7 +128,22 @@ def quantized_matvec_custom(
     b: mx.array,
     transpose_b: bool = False,
 ) -> mx.array:
-    pass
+    # Decode path (M <= 8). The extension defaults to use_simdgroup=True, so
+    # this lands on the SIMD-group matvec kernel.
+    *batch, D = a.shape
+    a = a.reshape(-1, D)
+    if a.shape[0] > 8:
+        raise ValueError("quantized_matvec_custom supports at most 8 input rows")
+    result = tiny_llm_ext.quantized_matmul(
+        mx.contiguous(scales),
+        mx.contiguous(biases),
+        group_size,
+        bits,
+        mx.contiguous(a),
+        mx.contiguous(b),
+        transpose_b,
+    )
+    return result.reshape(*batch, -1)
 
 
 def quantized_matmul_vanilla(
@@ -121,7 +155,18 @@ def quantized_matmul_vanilla(
     b: mx.array,
     transpose_b: bool = False,
 ) -> mx.array:
-    pass
+    # Inspectable one-thread-per-output control; kept callable so the
+    # optimized matvec can be compared directly against it.
+    return quantized_matmul(
+        scales,
+        biases,
+        group_size,
+        bits,
+        a,
+        b,
+        transpose_b,
+        use_simdgroup=False,
+    )
 
 
 def quantized_linear(
@@ -129,6 +174,32 @@ def quantized_linear(
     w: QuantizedWeights,
     bias: mx.array | None = None,
 ) -> mx.array:
-    
-    return quantized_matmul(w.scales, w.biases, w.group_size, w.bits, x, w.weight)
+
+    # Decode-shaped rows (flattened M <= 8) take the SIMD-group matvec;
+    # matrix-shaped prefill takes the general dispatcher.
+    rows = 1
+    for size in x.shape[:-1]:
+        rows *= size
+
+    if rows <= 8 and w.use_simdgroup_matvec:
+        result = quantized_matvec_custom(
+            w.scales, w.biases, w.group_size, w.bits, x, w.weight, True
+        )
+    else:
+        result = quantized_matmul(
+            w.scales,
+            w.biases,
+            w.group_size,
+            w.bits,
+            x,
+            w.weight,
+            True,
+            use_simdgroup=w.use_simdgroup_matmul,
+            use_split_k=w.use_split_k_matmul,
+        )
+
+    if bias is not None:
+        result = result + bias
+
+    return result
 
