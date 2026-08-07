@@ -12,6 +12,7 @@ from .quantize import QuantizedWeights, dequantize_linear, quantized_linear
 from .week2_kernels import (
     FastRMSNorm,
     FastRoPE,
+    decode_attention_custom,
     scaled_dot_product_attention,
     swiglu,
 )
@@ -80,7 +81,11 @@ class Qwen3MultiHeadAttention:
         self.theta = theta
         self.rms_norm_eps = rms_norm_eps
 
-        self.rope = RoPE(head_dim, max_seq_len, theta)
+        # Fast kernels unlock per checkpoint; the readable versions stay in
+        # place below their checkpoints.
+        rope_cls = FastRoPE if use_fast_rope else RoPE
+        self.rope = rope_cls(head_dim, max_seq_len, theta)
+        self.scale = self.head_dim ** -0.5
 
 
     # x -> (B, L, E)
@@ -101,14 +106,20 @@ class Qwen3MultiHeadAttention:
         Q = Q.reshape(Q.shape[0], Q.shape[1], self.num_heads, self.head_dim)
         K = K.reshape(K.shape[0], K.shape[1], self.num_kv_heads, self.head_dim)
         V = V.reshape(V.shape[0], V.shape[1], self.num_kv_heads, self.head_dim)
-        Q_rmsnorm = RMSNorm(self.head_dim, self.q_norm, self.rms_norm_eps)
+        norm_cls = FastRMSNorm if self.use_fast_rms_norm else RMSNorm
+        Q_rmsnorm = norm_cls(self.head_dim, self.q_norm, self.rms_norm_eps)
         Q = Q_rmsnorm(Q)
 
-        K_rmsnorm = RMSNorm(self.head_dim, self.k_norm, self.rms_norm_eps)
+        K_rmsnorm = norm_cls(self.head_dim, self.k_norm, self.rms_norm_eps)
         K = K_rmsnorm(K)
 
-        Q = self.rope(Q, slice(offsets, offsets+Q.shape[1])) # (B, L, Hq x D)
-        K = self.rope(K, slice(offsets, offsets+K.shape[1]))
+        if self.use_fast_rope:
+            # FastRoPE takes raw scalar or per-batch-row offsets.
+            Q = self.rope(Q, offsets) # (B, L, Hq x D)
+            K = self.rope(K, offsets)
+        else:
+            Q = self.rope(Q, slice(offsets, offsets+Q.shape[1])) # (B, L, Hq x D)
+            K = self.rope(K, slice(offsets, offsets+K.shape[1]))
 
         
 
@@ -118,7 +129,23 @@ class Qwen3MultiHeadAttention:
 
         K, V, _, _ = cache.update_and_fetch(K, V) # (B, S, H x D)
 
-        weighted_values = scaled_dot_product_attention_grouped(Q, K, V, mask=mask) # (B, Hq, L, D)
+        # Decode-shaped work inside the measured context window takes the
+        # custom online-softmax kernel; everything else (prefill, long
+        # context, explicit masks) stays on the readable grouped path.
+        # Post-transpose layouts: Q=(B,Hq,L,D), K=(B,Hkv,S,D).
+        query_len = Q.shape[-2]
+        context_len = K.shape[-3]
+        if (
+            self.use_decode_attention
+            and query_len <= DECODE_ATTENTION_MAX_QUERY
+            and context_len <= DECODE_ATTENTION_MAX_CONTEXT
+            and not isinstance(mask, mx.array)
+        ):
+            weighted_values = decode_attention_custom(
+                Q, K, V, scale=self.scale, mask=mask
+            ) # (B, Hq, L, D)
+        else:
+            weighted_values = scaled_dot_product_attention_grouped(Q, K, V, self.scale, mask) # (B, Hq, L, D)
         weighted_values = weighted_values.swapaxes(2, 1)
         weighted_values = weighted_values.reshape(Q.shape[0], Q.shape[2], self.num_heads*self.head_dim) #(B, L, Hq X D)
 
@@ -152,8 +179,12 @@ class Qwen3MLP:
     def __call__(self, x: mx.array) -> mx.array:
 
         up = _linear(x, self.w_up)
-        gate = silu(_linear(x, self.w_gate))
-        intermediate = up * gate
+        if self.use_fast_swiglu:
+            gate = _linear(x, self.w_gate)
+            intermediate = swiglu(gate, up)
+        else:
+            gate = silu(_linear(x, self.w_gate))
+            intermediate = up * gate
 
 
         out = _linear(intermediate, self.w_down)
@@ -218,12 +249,13 @@ class Qwen3TransformerBlock:
         self.w_input_layernorm = w_input_layernorm
         self.w_post_attention_layernorm = w_post_attention_layernorm
 
-        self.input_layernorm = RMSNorm(self.head_dim, self.w_input_layernorm, self.rms_norm_eps)
+        norm_cls = FastRMSNorm if use_fast_rms_norm else RMSNorm
+        self.input_layernorm = norm_cls(self.hidden_size, self.w_input_layernorm, self.rms_norm_eps)
         self.self_attn = Qwen3MultiHeadAttention(self.hidden_size, self.num_attention_heads, self.num_kv_heads, self.head_dim, self.wq, self.wk, self.wv, self.wo, self.q_norm, self.k_norm, self.max_seq_len, self.theta, self.rms_norm_eps, self.use_fast_rms_norm, self.use_fast_rope, self.use_decode_attention)
 
         self.mlp = Qwen3MLP(self.head_dim, self.hidden_size, self.w_gate, self.w_up, self.w_down, self.use_fast_swiglu)
 
-        self.post_attention_layernorm = RMSNorm(self.head_dim, self.w_post_attention_layernorm, self.rms_norm_eps)
+        self.post_attention_layernorm = norm_cls(self.hidden_size, self.w_post_attention_layernorm, self.rms_norm_eps)
 
     def __call__(
         self,
@@ -275,6 +307,9 @@ class Qwen3ModelWeek2:
 
         self.vocab_size = mlx_model.args.vocab_size
         self.embedding_dim = mlx_model.args.hidden_size
+        # Course-facing names used by the tests and benchmarks.
+        self.hidden_size = self.embedding_dim
+        self.precision = mx.bfloat16
 
         self.num_attention_heads = mlx_model.args.num_attention_heads
         self.num_kv_heads = mlx_model.args.num_key_value_heads
@@ -316,7 +351,10 @@ class Qwen3ModelWeek2:
             layer = Qwen3TransformerBlock(self.num_attention_heads, self.num_kv_heads, self.embedding_dim, self.head_dim, self.intermediate_size, self.rms_norm_eps, wq, wk, wv, wo, q_norm, k_norm, w_gate, w_up, w_down, w_input_layernorm, w_post_attention_layernorm, self.max_seq_len, self.theta, self.use_fast_rms_norm, self.use_fast_rope, self.use_fast_swiglu, self.use_decode_attention)
             self.layers_inner.append(layer)
         
-        self.output_layernorm = RMSNorm(self.embedding_dim, mlx_model.model.norm.weight, self.rms_norm_eps)
+        norm_cls = FastRMSNorm if self.use_fast_rms_norm else RMSNorm
+        self.norm = norm_cls(self.embedding_dim, mlx_model.model.norm.weight, self.rms_norm_eps)
+        # Alias kept for the earlier checkpoints and notebooks.
+        self.output_layernorm = self.norm
         
         if(not mlx_model.args.tie_word_embeddings ):
             # lm_head is a projection, not a lookup: keep it quantized too.

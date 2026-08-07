@@ -39,8 +39,10 @@ class Qwen3MultiHeadAttention:
         self.wv = wv
         self.wo = wo
 
-        self.q_norm = q_norm
-        self.k_norm = k_norm
+        # Hold the readable norm objects (weights stay on .weight); Week 1
+        # keeps the readable kernels while Week 2 adds the fast ones.
+        self.q_norm = RMSNorm(head_dim, q_norm, rms_norm_eps)
+        self.k_norm = RMSNorm(head_dim, k_norm, rms_norm_eps)
         self.max_seq_len = max_seq_len
         self.theta = theta
         self.rms_norm_eps = rms_norm_eps
@@ -64,8 +66,8 @@ class Qwen3MultiHeadAttention:
         k = k.reshape(k.shape[0], k.shape[1], self.num_kv_heads, self.head_dim)
         v = v.reshape(v.shape[0], v.shape[1], self.num_kv_heads, self.head_dim)
 
-        q = mx.fast.rms_norm(q, self.q_norm, self.rms_norm_eps)
-        k = mx.fast.rms_norm(k, self.k_norm, self.rms_norm_eps)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         
         q = self.rope(q)
         k = self.rope(k)

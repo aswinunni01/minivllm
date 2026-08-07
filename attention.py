@@ -100,7 +100,12 @@ def scaled_dot_product_attention_grouped(
     # value_reshaped -> (B, H, 1, S, D)
     v_reshaped = value.reshape(*value.shape[:-2], 1, value.shape[-2], value.shape[-1])
 
-    if mask is not None and not isinstance(mask, str):  
+    if mask is not None and not isinstance(mask, str):
+        # Broadcast partial masks up to the full [.., Hq, L, S] extent before
+        # folding the head axis into GQA groups.
+        mask = mx.broadcast_to(
+            mask, (*query.shape[:-3], query.shape[-3], query.shape[-2], key.shape[-2])
+        )
         mask = mask.reshape(*query.shape[:-3], key.shape[-3], n_repeats, query.shape[-2], key.shape[-2])
     if(mask is not None and mask == "causal"):
         mask = causal_mask(query.shape[-2], key.shape[-2], dtype=query.dtype)
