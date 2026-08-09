@@ -26,6 +26,7 @@ class QuantizedEmbedding:
         self.vocab_size = vocab_size
         self.embedding_dim = embedding_dim
         self.weight = weight
+        self.use_custom_kernel = use_custom_kernel
 
     def __call__(self, x: mx.array) -> mx.array:
         embeddings_quantized = self.weight.weight[x]

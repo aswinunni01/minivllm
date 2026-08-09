@@ -358,9 +358,9 @@ class Qwen3ModelWeek2:
         
         if(not mlx_model.args.tie_word_embeddings ):
             # lm_head is a projection, not a lookup: keep it quantized too.
-            self.out_lm_head = model_weight(mlx_model.lm_head)
+            self.w_lm_head = model_weight(mlx_model.lm_head)
         else:
-            self.out_lm_head = None
+            self.w_lm_head = None
 
 
     def create_kv_cache(self) -> list[TinyKvCache]:
@@ -390,11 +390,18 @@ class Qwen3ModelWeek2:
                 raise ValueError(f"layer {i} cache offset {cache_i_offset} does not match model offset {offset}")
             x = layer(x, offset, cache_i, mask="causal")
 
-        x = self.output_layernorm(x)
+        # Generation only needs the trailing rows for the head projection;
+        # slice before the norm/head so prefill skips the vocab matmul.
+        if logits_to_keep is not None:
+            if logits_to_keep <= 0:
+                raise ValueError("logits_to_keep must be positive")
+            x = x[:, -logits_to_keep:, :]
 
-        if(self.out_lm_head is None):
+        x = self.norm(x)
+
+        if(self.w_lm_head is None):
             x = self.embedding.as_linear(x)
         else:
-            x = _linear(x, self.out_lm_head)
+            x = _linear(x, self.w_lm_head)
 
         return x
