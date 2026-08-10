@@ -118,8 +118,18 @@ class Qwen3MultiHeadAttention:
             Q = self.rope(Q, offsets) # (B, L, Hq x D)
             K = self.rope(K, offsets)
         else:
-            Q = self.rope(Q, slice(offsets, offsets+Q.shape[1])) # (B, L, Hq x D)
-            K = self.rope(K, slice(offsets, offsets+K.shape[1]))
+            # The readable RoPE indexes its precomputed table with slices;
+            # normalize scalars and per-row offsets to that form.
+            if isinstance(offsets, mx.array):
+                readable_offsets = [
+                    slice(int(v), int(v) + Q.shape[1]) for v in mx.reshape(offsets, (-1,))
+                ]
+            elif isinstance(offsets, int):
+                readable_offsets = slice(offsets, offsets + Q.shape[1])
+            else:
+                readable_offsets = [slice(v, v + Q.shape[1]) for v in offsets]
+            Q = self.rope(Q, readable_offsets) # (B, L, Hq x D)
+            K = self.rope(K, readable_offsets)
 
         
 
@@ -127,7 +137,11 @@ class Qwen3MultiHeadAttention:
         K = K.transpose(0, 2, 1, 3)
         V = V.transpose(0, 2, 1, 3)
 
-        K, V, _, _ = cache.update_and_fetch(K, V) # (B, S, H x D)
+        # Batching caches use mask_length/mask to build one dense per-row
+        # mask and return it; dense caches pass the mask through unchanged.
+        K, V, _, mask = cache.update_and_fetch(
+            K, V, mask_length=Q.shape[-2], mask=mask
+        ) # (B, S, H x D)
 
         # Decode-shaped work inside the measured context window takes the
         # custom online-softmax kernel; everything else (prefill, long
@@ -382,13 +396,17 @@ class Qwen3ModelWeek2:
         
         x = self.embedding(inputs)
 
+        # Single-token decode steps see the full context through the cache;
+        # multi-row prefill needs the causal mask.
+        mask = None if inputs.shape[1] == 1 else "causal"
+
         for i in range(self.num_hidden_layers):
             layer = self.layers_inner[i]
             cache_i = cache[i]
             cache_i_offset = getattr(cache_i, "offset", None)
-            if(cache_i_offset is not None and cache_i_offset != offset):
+            if(cache_i_offset is not None and isinstance(offset, int) and cache_i_offset != offset):
                 raise ValueError(f"layer {i} cache offset {cache_i_offset} does not match model offset {offset}")
-            x = layer(x, offset, cache_i, mask="causal")
+            x = layer(x, offset, cache_i, mask=mask)
 
         # Generation only needs the trailing rows for the head projection;
         # slice before the norm/head so prefill skips the vocab matmul.
