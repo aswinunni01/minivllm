@@ -24,7 +24,6 @@ class Request:
         max_seq_len: int | None = None,
     ):
         self.prompt = prompt
-        self.kv_cache = model.create_kv_cache()
         self.model = model
         self.detokenizer = tokenizer.detokenizer.__class__(tokenizer._tokenizer)
         self.prefill_tokens = mx.array(
@@ -35,6 +34,9 @@ class Request:
                 f"Prompt has {self.prefill_tokens.size} tokens, which exceeds "
                 f"max_seq_len={max_seq_len}"
             )
+        # Validate before touching the cache factory so oversized prompts
+        # allocate nothing.
+        self.kv_cache = model.create_kv_cache()
         self.prefill_max_step = prefill_max_step
         self.max_seq_len = max_seq_len
         self.is_done = False
@@ -51,27 +53,32 @@ class Request:
         """
         if self.is_prefill_done:
             raise ValueError("prefill called after done")
-        # Day 1 admits the complete prompt in one model call.
+        # Chunked prefill: process at most prefill_max_step tokens per call so
+        # one long prompt cannot starve active decodes for a whole step.
+        tokens_to_prefill = min(
+            self.prefill_max_step, self.prefill_tokens.size - self.offset
+        )
         token = _step(
             self.model,
-            self.prefill_tokens[self.offset :][None],
+            self.prefill_tokens[self.offset : self.offset + tokens_to_prefill][None],
             [self.offset],
             self.kv_cache,
         )
-        self.offset = self.prefill_tokens.size
+        self.offset += tokens_to_prefill
 
-        # Materialize the KV caches to cut the lazy graph after the big prefill.
+        # Materialize KV caches between chunks so the lazy graph stays bounded.
         for layer_cache in self.kv_cache:
             layer_cache.materialize()
 
-        self.is_prefill_done = True
-        mx.eval(token)
-        if self.max_seq_len is not None and self.offset >= self.max_seq_len:
-            self.is_done = True
-            self.finish_reason = "max seq len"
-        else:
-            # The last prompt token already produced the first sampled token.
-            self.decode_done(token.item(), update_offset=False)
+        if self.offset == self.prefill_tokens.size:
+            self.is_prefill_done = True
+            mx.eval(token)
+            if self.max_seq_len is not None and self.offset >= self.max_seq_len:
+                self.is_done = True
+                self.finish_reason = "max seq len"
+            else:
+                # The last prompt token already produced the first sampled token.
+                self.decode_done(token.item(), update_offset=False)
 
     def decode_done(self, token, update_offset=True):
         if self.is_done:
