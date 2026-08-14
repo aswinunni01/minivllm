@@ -1,4 +1,7 @@
 import mlx.core as mx
+
+from extensions import tiny_llm_ext
+
 from .quantize import QuantizedWeights, dequantize_weights, quantized_linear
 
 
@@ -29,11 +32,23 @@ class QuantizedEmbedding:
         self.use_custom_kernel = use_custom_kernel
 
     def __call__(self, x: mx.array) -> mx.array:
-        embeddings_quantized = self.weight.weight[x]
-        scales = self.weight.scales[x]
-        biases = None if self.weight.biases is None else self.weight.biases[x]
-        embeddings_dequantized = dequantize_weights(embeddings_quantized, scales, biases, self.weight.group_size, self.weight.bits)
-        return embeddings_dequantized
+        if not self.use_custom_kernel or self.weight.biases is None:
+            # Readable selected-row lookup: gather packed rows and dequantize
+            # with the shared unpacking helper.
+            embeddings_quantized = self.weight.weight[x]
+            scales = self.weight.scales[x]
+            biases = None if self.weight.biases is None else self.weight.biases[x]
+            embeddings_dequantized = dequantize_weights(embeddings_quantized, scales, biases, self.weight.group_size, self.weight.bits)
+            return embeddings_dequantized
+        # Week 3: one kernel gathers codes and applies scale/bias directly.
+        return tiny_llm_ext.quantized_embedding(
+            x,
+            self.weight.scales,
+            self.weight.biases,
+            self.weight.weight,
+            self.weight.group_size,
+            self.weight.bits,
+        )
 
 
     def as_linear(self, x: mx.array) -> mx.array:
