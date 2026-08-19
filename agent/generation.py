@@ -19,9 +19,12 @@ Generate = Callable[[list[Message]], str]
 
 def initial_messages(task: str, system_prompt: str) -> list[Message]:
     """Create the durable beginning of an agent conversation."""
-
-    # TODO: reject an empty task; return system + user messages.
-    pass
+    if not task.strip():
+        raise ValueError("task must not be empty")
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": task},
+    ]
 
 
 def generate_response(
@@ -33,7 +36,33 @@ def generate_response(
     enable_thinking: bool = False,
 ) -> str:
     """Decode one action with the course model and a fresh cache."""
+    import mlx.core as mx
 
-    # TODO: apply the chat template, decode up to max_tokens with the model,
-    # stop at eos, release every cache, and return the decoded text.
-    pass
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=enable_thinking,
+    )
+    tokens = mx.array(tokenizer.encode(prompt, add_special_tokens=False))
+    caches = list(cache_factory())
+    output: list[int] = []
+    offset = 0
+    try:
+        for _ in range(max_tokens):
+            logits = model(tokens[None], offset, caches)[:, -1, :]
+            token = int(mx.argmax(logits, axis=-1).item())
+            if token == tokenizer.eos_token_id:
+                break
+            output.append(token)
+            offset += tokens.size
+            tokens = mx.array([token])
+        return tokenizer.decode(output)
+    finally:
+        # A fresh cache per call means nothing survives to leak across calls.
+        for cache in caches:
+            release = getattr(cache, "release", None)
+            if release is not None:
+                release()
