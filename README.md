@@ -1,6 +1,6 @@
 # minivllm
 
-A high-performance LLM inference and serving engine built from scratch in Python and MLX, optimized for Apple Silicon (M4 Pro). 
+A high-performance LLM inference and serving engine built from scratch in Python and MLX, optimized for Apple Silicon. 
 
 This repository contains my personal, from-scratch implementation of the `tiny-llm` course, working step-by-step from fundamental matrix operations to a fully-functioning serving engine with continuous batching, custom kernels, and paged attention.
 
@@ -14,12 +14,8 @@ This repository contains my personal, from-scratch implementation of the `tiny-l
 - **SwiGLU**: Fused gated linear unit activation function.
 
 ### 🧠 Attention Mechanisms (`attention.py`)
-- **Grouped Query Attention (GQA)**: Custom implementation mapping Qwen3-4B structures.
+- **Grouped Query Attention (GQA)**: Custom implementation mapping Qwen3-0.6B/4B structures.
 - **Causal Masking**: Scaled dot-product attention with causal masking.
-
-### ⚡ Custom Kernels & Quantization (`quantize.py`, `week2_kernels.py`)
-- **Quantization**: 4-bit and 8-bit model weight quantization.
-- **Fused Operators**: Model kernels fusing RMSNorm, RoPE, SwiGLU, and Decode Attention to improve memory bandwidth utilisation.
 
 ### 💾 Memory & Serving Infrastructure (`kv_cache.py`, `paged_kv_cache.py`, `batch.py`)
 - **Paged KV Cache**: Dynamic allocation of key-value cache blocks (similar to vLLM) to prevent memory fragmentation.
@@ -28,21 +24,14 @@ This repository contains my personal, from-scratch implementation of the `tiny-l
 
 ---
 
-## 📊 Benchmarks (Apple M4 Pro)
+## 📊 Benchmarks (Apple M1 Air, 16GB)
 
-The following benchmark values are evaluated on **Qwen3-4B** (Input: 128 tokens, Output: 129 tokens) showing the performance progression of optimization stages compared to the MLX reference baseline:
+The following benchmark values are evaluated on **Qwen3-0.6B** (Input: 128 tokens, Output: 129 tokens, `prefill-logits=all`):
 
-| Optimization Step | Prefill Latency (ms) | Decode Latency (ms) | Output Rate (tokens/s) |
-| :--- | :---: | :---: | :---: |
-| **2.1 KV Cache** | 730.43 | 24.62 | 24.00 |
-| **2.3 Quantized Matvec** | 105.00 | 58.70 | 37.94 |
-| **2.4 Fast RMSNorm** | 104.98 | 65.94 | 40.81 |
-| **2.4 + Fast RoPE** | 105.39 | 71.16 | 42.81 |
-| **2.4 + Fused SwiGLU** | 105.96 | 75.21 | 44.32 |
-| **2.5 Decode Attention** | 105.98 | 75.74 | 44.50 |
-| **2.6 SIMD Matrix Prefill** | 797.45 | 75.12 | 69.17 |
-| **2.7 Split-K Prefill** | 792.54 | 75.40 | 69.37 |
-| **MLX Baseline** | 830.49 | 89.37 | 81.30 |
+| Checkpoint | Prefill Throughput (tok/s) | Decode Throughput (tok/s) | Notes |
+| :--- | :---: | :---: | :--- |
+| **Week 1 (No Cache)** | 1007.65 | 4.69 | Recomputes full context every step |
+| **MLX Baseline** | 833.83 | 108.21 | MLX reference baseline |
 
 ---
 
