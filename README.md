@@ -44,6 +44,12 @@ This project is typically linked inside the `tiny-llm` training directory as a s
 ln -s /path/to/minivllm /path/to/tiny-llm/src/tiny_llm
 ```
 
+### Metal / C++ kernels
+The MLX extension kernels (quantized matvec/matmul, fused RMSNorm/RoPE/SwiGLU,
+decode attention, paged attention, FlashAttention prefill) live under
+[`extensions/`](./extensions) - a synced mirror of `tiny-llm/src/extensions`,
+where the course builds them.
+
 ### Running Tests
 To verify implementation correctness:
 ```bash
