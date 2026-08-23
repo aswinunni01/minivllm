@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minivllm"
+version = "0.1.0"
+description = "A tiny LLM inference engine for Apple Silicon, built from scratch following the tiny-llm course"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "mlx>=0.32.0",
+    "mlx-lm>=0.31.3",
+    "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+# Needed once to compile the Metal/C++ extension (macOS + Apple Silicon only)
+build = ["nanobind==2.13.0", "cmake>=3.27"]
+
+[tool.setuptools]
+# The repository root IS the `tiny_llm` package (course convention: it is
+# symlinked as tiny-llm/src/tiny_llm when working inside the course checkout).
+package-dir = { "tiny_llm" = ".", "extensions" = "extensions" }
+packages = ["tiny_llm", "tiny_llm.agent", "extensions", "extensions.tiny_llm_ext"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

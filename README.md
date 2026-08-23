@@ -50,6 +50,27 @@ decode attention, paged attention, FlashAttention prefill) live under
 [`extensions/`](./extensions) - a synced mirror of `tiny-llm/src/extensions`,
 where the course builds them.
 
+### Running a Model (fresh clone, Apple Silicon Mac)
+
+```bash
+# 1. Install the package and build dependencies
+pip install -e ".[build]"
+
+# 2. Compile the Metal extension (once, ~a minute)
+cd extensions && python build.py && cd ..
+
+# 3. Generate! (downloads Qwen3-0.6B 4-bit on first run)
+python scripts/run_model.py --prompt "Explain KV caching in one paragraph."
+
+# Week 2 checkpoints can be selected individually...
+python scripts/run_model.py --checkpoint kv-cache --prompt "Hello!"
+# ...or run the Week 3 serving model with paged KV + paged attention
+python scripts/run_model.py --week3 --prompt "Write a haiku about caches."
+```
+
+Requirements: an Apple Silicon Mac with the Metal toolchain (Xcode or the
+Metal developer tools). The engine is GPU-only by design.
+
 ### Running Tests
 To verify implementation correctness:
 ```bash
